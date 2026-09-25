@@ -11,6 +11,7 @@ tool allowlist, caches results inside one case only and emits ``tool_result_cons
 from __future__ import annotations
 
 import asyncio
+<<<<<<< Updated upstream
 import json
 import os
 import re
@@ -19,6 +20,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+=======
+import hashlib
+>>>>>>> Stashed changes
 from typing import Any
 
 from . import OUTPUT_SCHEMA_VERSION
@@ -853,9 +857,748 @@ def verifier(output: dict[str, Any], mcp: CaseScopedGateway, entity_rejected: li
 # --------------------------------------------------------------------------- coordinator
 
 
+class CaseCache:
+    """Per-case MCP call cache."""
+
+    def __init__(self) -> None:
+        self._store: dict[str, dict[str, Any]] = {}
+
+    def _key(self, tool_name: str, args: dict[str, Any]) -> str:
+        """Generate cache key from tool name and arguments."""
+        args_str = str(sorted((k, v) for k, v in args.items() if k != "case_id"))
+        return f"{tool_name}:{hashlib.md5(args_str.encode()).hexdigest()[:12]}"
+
+    def get(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
+        return self._store.get(self._key(tool_name, args))
+
+    def set(self, tool_name: str, args: dict[str, Any], evidence: dict[str, Any]) -> None:
+        self._store[self._key(tool_name, args)] = evidence
+
+
+class MCPClient:
+    """Wrapper around EvidenceGateway with caching, retries, and trace emission."""
+
+    def __init__(
+        self,
+        gateway: EvidenceGateway,
+        trace: TraceWriter,
+        case_id: str,
+        actor: str,
+        cache: CaseCache,
+    ) -> None:
+        self.gateway = gateway
+        self.trace = trace
+        self.case_id = case_id
+        self.actor = actor
+        self.cache = cache
+        self.semaphore = asyncio.Semaphore(5)  # max 5 concurrent calls
+
+    async def call(
+        self,
+        tool_name: str,
+        purpose: str,
+        **args: Any,
+    ) -> dict[str, Any] | None:
+        """Call MCP tool with caching, retries, and trace emission."""
+        cache_args = {"case_id": self.case_id, **args}
+        cached = self.cache.get(tool_name, cache_args)
+        if cached:
+            return cached
+
+        async with self.semaphore:
+            for attempt in range(3):  # max 2 retries = 3 attempts
+                try:
+                    evidence = await self.gateway.call(tool_name, case_id=self.case_id, **args)
+                    self.cache.set(tool_name, cache_args, evidence)
+                    self.trace.emit(
+                        case_id=self.case_id,
+                        event_type="tool_result_consumed",
+                        actor=self.actor,
+                        tool_name=tool_name,
+                        evidence_refs=[evidence["evidence_ref"]],
+                        attributes={"purpose": purpose},
+                    )
+                    return evidence
+                except Exception as exc:
+                    if attempt == 2:  # last attempt failed
+                        code = "MCP_TIMEOUT" if "timeout" in str(exc).lower() else "MCP_ERROR"
+                        self.trace.emit(
+                            case_id=self.case_id,
+                            event_type="tool_failed",
+                            actor=self.actor,
+                            tool_name=tool_name,
+                            decision_code=code,
+                            attributes={"purpose": purpose, "error": str(exc)[:200]},
+                        )
+                        return None
+                    await asyncio.sleep(2**attempt)  # exponential backoff
+            return None
+
+
+class EntityResolver:
+    """Resolve customer_unique_id and order_id from case candidates."""
+
+    def __init__(
+        self,
+        mcp: MCPClient,
+        trace: TraceWriter,
+        case_id: str,
+        case: dict[str, Any],
+    ) -> None:
+        self.mcp = mcp
+        self.trace = trace
+        self.case_id = case_id
+        self.case = case
+
+    async def resolve(self) -> dict[str, Any]:
+        # Input uses candidate_order_ids (strings) + customer_unique_id_hint
+        candidate_ids = self.case.get("candidate_order_ids", [])
+        customer_hint = self.case.get("customer_unique_id_hint")
+        claimed_order_id = self.case.get("customer_request", {}).get("claimed_order_id")
+
+        if not candidate_ids:
+            return {
+                "status": "not_found",
+                "resolved_order_ids": [],
+                "rejected_candidates": [],
+                "confidence": 0.0,
+                "customer_unique_id": customer_hint,
+                "order_id": None,
+            }
+
+        # Build candidate objects from IDs
+        candidates = []
+        for cid in candidate_ids:
+            candidates.append({
+                "order_id": cid,
+                "customer_unique_id": customer_hint,
+            })
+
+        scored = []
+        for c in candidates:
+            score = 0
+            reasons = []
+
+            # 1. Exact match with claimed_order_id (40 pts)
+            if c.get("order_id") and claimed_order_id == c["order_id"]:
+                score += 40
+                reasons.append("claimed_order_id_match")
+
+            # 2. Customer hint match (20 pts)
+            if customer_hint and c.get("customer_unique_id") == customer_hint:
+                score += 20
+                reasons.append("customer_hint_match")
+
+            # 3. Default base score
+            score += 20
+            reasons.append("candidate_present")
+
+            scored.append((score, c, reasons))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_candidate, reasons = scored[0]
+        confidence = min(best_score / 100.0, 1.0)
+
+        # Threshold logic
+        if confidence >= 0.75:
+            status = "resolved"
+        elif confidence >= 0.4:
+            status = "ambiguous"
+        else:
+            status = "not_found"
+
+        best_oid = best_candidate.get("order_id")
+        resolved_order_ids = [best_oid] if best_oid else []
+        rejected = [c.get("order_id") for _, c, _ in scored[1:] if c.get("order_id")]
+
+        self.trace.emit(
+            case_id=self.case_id,
+            event_type="task_assigned",
+            actor="entity_resolver",
+            target="coordinator",
+            decision_code=status,
+            attributes={
+                "confidence": confidence,
+                "resolved_order_id": best_candidate.get("order_id"),
+                "rejected_count": len(rejected),
+            },
+        )
+
+        return {
+            "status": status,
+            "resolved_order_ids": resolved_order_ids,
+            "rejected_candidates": rejected,
+            "confidence": round(confidence, 3),
+            "customer_unique_id": best_candidate.get("customer_unique_id"),
+            "order_id": best_candidate.get("order_id"),
+            "scoring_reasons": reasons,
+        }
+
+
+class OrderProductAgent:
+    """Order, items, product context, sellers."""
+
+    def __init__(self, mcp: MCPClient) -> None:
+        self.mcp = mcp
+
+    async def investigate(self, order_id: str) -> dict[str, Any]:
+        results = await asyncio.gather(
+            self.mcp.call("get_order", "order_verification", order_id=order_id),
+            self.mcp.call("get_order_items", "order_items", order_id=order_id),
+            self.mcp.call("get_product_context", "product_context", order_id=order_id),
+            self.mcp.call("get_sellers", "sellers", order_id=order_id),
+            return_exceptions=True,
+        )
+
+        order_ev, items_ev, product_ev, sellers_ev = results
+
+        evidence_refs = []
+        for ev in [order_ev, items_ev, product_ev, sellers_ev]:
+            if ev and isinstance(ev, dict) and ev.get("evidence_ref"):
+                evidence_refs.append(ev["evidence_ref"])
+
+        return {
+            "order": order_ev["data"] if order_ev and isinstance(order_ev, dict) else None,
+            "items": items_ev["data"] if items_ev and isinstance(items_ev, dict) else None,
+            "product": product_ev["data"] if product_ev and isinstance(product_ev, dict) else None,
+            "sellers": sellers_ev["data"] if sellers_ev and isinstance(sellers_ev, dict) else None,
+            "evidence_refs": evidence_refs,
+        }
+
+
+class ShipmentAgent:
+    """Shipment timeline and status."""
+
+    def __init__(self, mcp: MCPClient) -> None:
+        self.mcp = mcp
+
+    async def investigate(self, order_id: str) -> dict[str, Any]:
+        ev = await self.mcp.call("get_shipment_summary", "shipment_timeline", order_id=order_id)
+
+        evidence_refs = [ev["evidence_ref"]] if ev and ev.get("evidence_ref") else []
+
+        return {
+            "summary": ev["data"] if ev and isinstance(ev, dict) else None,
+            "evidence_refs": evidence_refs,
+        }
+
+
+class PaymentRefundAgent:
+    """Payment and refund analysis."""
+
+    def __init__(self, mcp: MCPClient) -> None:
+        self.mcp = mcp
+
+    async def investigate(self, order_id: str) -> dict[str, Any]:
+        results = await asyncio.gather(
+            self.mcp.call("get_order_payments", "payment_details", order_id=order_id),
+            self.mcp.call("get_payment_timeline", "payment_timeline", order_id=order_id),
+            self.mcp.call("get_refund_timeline", "refund_timeline", order_id=order_id),
+            return_exceptions=True,
+        )
+
+        payments_ev, timeline_ev, refund_ev = results
+
+        evidence_refs = []
+        for ev in [payments_ev, timeline_ev, refund_ev]:
+            if ev and isinstance(ev, dict) and ev.get("evidence_ref"):
+                evidence_refs.append(ev["evidence_ref"])
+
+        return {
+            "payments": (
+                payments_ev["data"] if payments_ev and isinstance(payments_ev, dict) else None
+            ),
+            "timeline": (
+                timeline_ev["data"] if timeline_ev and isinstance(timeline_ev, dict) else None
+            ),
+            "refunds": (
+                refund_ev["data"] if refund_ev and isinstance(refund_ev, dict) else None
+            ),
+            "evidence_refs": evidence_refs,
+        }
+
+
+class PolicyAgent:
+    """Policy lookup."""
+
+    def __init__(self, mcp: MCPClient) -> None:
+        self.mcp = mcp
+
+    async def investigate(self, category: str, complaint_text: str) -> dict[str, Any]:
+        ev = await self.mcp.call(
+            "get_policy", "policy_lookup", category=category, complaint_text=complaint_text
+        )
+
+        evidence_refs = [ev["evidence_ref"]] if ev and ev.get("evidence_ref") else []
+
+        return {
+            "policy": ev["data"] if ev and isinstance(ev, dict) else None,
+            "evidence_refs": evidence_refs,
+        }
+
+
+class CustomerAgent:
+    """Customer history."""
+
+    def __init__(self, mcp: MCPClient) -> None:
+        self.mcp = mcp
+
+    async def investigate(self, customer_unique_id: str) -> dict[str, Any]:
+        ev = await self.mcp.call(
+            "get_customer_history", "customer_history", customer_unique_id=customer_unique_id
+        )
+
+        evidence_refs = [ev["evidence_ref"]] if ev and ev.get("evidence_ref") else []
+
+        return {
+            "history": ev["data"] if ev and isinstance(ev, dict) else None,
+            "evidence_refs": evidence_refs,
+        }
+
+
+class ConflictResolver:
+    """Detect and resolve evidence conflicts."""
+
+    def __init__(self, trace: TraceWriter, case_id: str) -> None:
+        self.trace = trace
+        self.case_id = case_id
+
+    def resolve(
+        self,
+        all_evidence: dict[str, Any],
+        entity_resolution: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return (data_conflicts, resolution_notes)."""
+        conflicts = []
+        resolution_notes = []
+
+        # Example: shipment delivered but payment pending
+        shipment = all_evidence.get("shipment", {}).get("summary")
+        payment = all_evidence.get("payment", {}).get("payments")
+
+        if shipment and payment:
+            shipment_status = shipment.get("status") if isinstance(shipment, dict) else None
+            payment_status = payment.get("status") if isinstance(payment, dict) else None
+
+            if shipment_status == "delivered" and payment_status == "pending":
+                conflicts.append({
+                    "field": "payment_status_vs_shipment",
+                    "sources": ["shipment_summary", "payment_timeline"],
+                    "selected_source": "shipment_summary",
+                    "resolution_code": "SHIPMENT_PRECEDENCE",
+                })
+                resolution_notes.append(
+                "Shipment shows delivered; payment pending resolved to captured"
+            )
+
+        # Amount mismatch: order total vs payment sum
+        order = all_evidence.get("order", {}).get("order")
+        payments = all_evidence.get("payment", {}).get("payments")
+        if order and payments:
+            order_total = order.get("total_amount_brl") if isinstance(order, dict) else None
+            if isinstance(payments, list):
+                payment_sum = sum(p.get("amount_brl", 0) for p in payments if isinstance(p, dict))
+                if order_total and abs(order_total - payment_sum) > 0.01:
+                    conflicts.append({
+                        "field": "order_total_vs_payments",
+                        "sources": ["order", "order_payments"],
+                        "selected_source": "order_payments",
+                        "resolution_code": "PAYMENT_SUM_PRECEDENCE",
+                    })
+                    resolution_notes.append("Payment sum used as authoritative")
+
+        # Emit trace for each conflict
+        for c in conflicts:
+            self.trace.emit(
+                case_id=self.case_id,
+                event_type="policy_decided",
+                actor="conflict_resolver",
+                decision_code=c["resolution_code"],
+                attributes={"field": c["field"], "selected_source": c["selected_source"]},
+            )
+
+        return conflicts, resolution_notes
+
+
+class Verifier:
+    """Pre-finalize invariant checks."""
+
+    def __init__(self, trace: TraceWriter, case_id: str) -> None:
+        self.trace = trace
+        self.case_id = case_id
+
+    def verify(
+        self,
+        output: dict[str, Any],
+        all_evidence: dict[str, Any],
+        entity_res: dict[str, Any],
+    ) -> list[str]:
+        """Return list of issues (empty = pass)."""
+        issues = []
+
+        # 1. Schema valid - handled by caller
+        # 2. Entity scope
+        if output.get("case_id") != self.case_id:
+            issues.append("case_id mismatch")
+
+        # 3. Rejected candidates present
+        ent_status = entity_res.get("status")
+        ent_res = output.get("entity_resolution", {})
+        if ent_status in ("resolved", "ambiguous") and not ent_res.get("rejected_candidates"):
+            issues.append("missing rejected_candidates")
+
+        # 4. Evidence ownership
+        all_refs = set()
+        for ev in all_evidence.values():
+            all_refs.update(ev.get("evidence_refs", []))
+        output_refs = set(output.get("evidence_refs", []))
+        orphan_refs = output_refs - all_refs
+        if orphan_refs:
+            issues.append(f"orphan evidence_refs: {orphan_refs}")
+
+        # 5. Claim linkage
+        for claim in output.get("claim_assessments", []):
+            if not claim.get("evidence_refs"):
+                issues.append(f"claim {claim.get('claim_id')} has no evidence_refs")
+
+        # 6. Timeline consistency
+        shipment = all_evidence.get("shipment", {}).get("summary")
+        payment = all_evidence.get("payment", {}).get("timeline")
+        if (
+            shipment
+            and payment
+            and isinstance(shipment, dict)
+            and isinstance(payment, dict)
+        ):
+            delivered = shipment.get("delivered_at")
+            paid = payment.get("completed_at")
+            if delivered and paid and delivered > paid:
+                issues.append("shipment delivered after payment completed")
+
+        # 7. Payment/refund totals
+        payments = all_evidence.get("payment", {}).get("payments")
+        order = all_evidence.get("order", {}).get("order")
+        if (
+            payments
+            and order
+            and isinstance(payments, list)
+            and isinstance(order, dict)
+        ):
+            payment_sum = sum(p.get("amount_brl", 0) for p in payments if isinstance(p, dict))
+            order_total = order.get("total_amount_brl", 0)
+            if abs(payment_sum - order_total) > 0.5:
+                issues.append(f"payment sum {payment_sum} != order total {order_total}")
+
+        # 8. Source precedence - checked in conflict resolver
+
+        # 9. Responsibility/action consistency
+        root_cause = output.get("root_cause_analysis", {})
+        responsible = root_cause.get("responsible_parties", [])
+        resolution_actions = output.get("resolution_actions", [])
+        if responsible and not resolution_actions:
+            issues.append("has responsible_parties but no resolution_actions")
+
+        # 10. Confidence bounds
+        conf = output.get("assessment", {}).get("confidence", 0)
+        if not (0 <= conf <= 1):
+            issues.append("confidence out of bounds [0,1]")
+
+        if issues:
+            self.trace.emit(
+                case_id=self.case_id,
+                event_type="verification_completed",
+                actor="verifier",
+                decision_code="FAILED",
+                attributes={"issues": issues},
+            )
+        else:
+            self.trace.emit(
+                case_id=self.case_id,
+                event_type="verification_completed",
+                actor="verifier",
+                decision_code="PASSED",
+            )
+
+        return issues
+
+
+def _build_output(
+    case_id: str,
+    case: dict[str, Any],
+    entity_res: dict[str, Any],
+    all_evidence: dict[str, Any],
+    conflicts: list[dict[str, Any]],
+    resolution_notes: list[str],
+) -> dict[str, Any]:
+    """Build L3B output from collected evidence."""
+
+    # Extract key data
+    order = all_evidence.get("order", {}).get("order")
+    items = all_evidence.get("order", {}).get("items")
+    sellers = all_evidence.get("order", {}).get("sellers")
+    shipment = all_evidence.get("shipment", {}).get("summary")
+    payments = all_evidence.get("payment", {}).get("payments")
+    refunds = all_evidence.get("payment", {}).get("refunds")
+
+    # Collect all evidence_refs
+    all_refs = []
+    for ev in all_evidence.values():
+        all_refs.extend(ev.get("evidence_refs", []))
+    all_refs = list(dict.fromkeys(all_refs))  # dedupe preserving order
+
+    # ---- assessment ----
+    primary_issue = "insufficient_evidence"
+    secondary_issues = []
+    case_status = "needs_investigation"
+    confidence = entity_res.get("confidence", 0.0)
+
+    complaint_type = case.get("complaint", {}).get("type", "").lower()
+    if "late" in complaint_type or "delivery" in complaint_type:
+        if shipment and shipment.get("status") in ("late", "seller_delay", "logistics_delay"):
+            is_seller = "seller" in str(shipment).lower()
+            primary_issue = "late_delivery_seller" if is_seller else "late_delivery_logistics"
+            case_status = "action_required"
+        else:
+            primary_issue = "insufficient_evidence"
+    elif "payment" in complaint_type or "charge" in complaint_type:
+        if payments and isinstance(payments, list):
+            primary_issue = "payment_mismatch"
+            case_status = "action_required"
+    elif "refund" in complaint_type:  # noqa: SIM102
+        if (
+            refunds
+            and isinstance(refunds, list)
+            and len(refunds) > 0
+        ):
+            has_pending = any(
+                r.get("status") == "pending" for r in refunds if isinstance(r, dict)
+            )
+            primary_issue = "refund_pending" if has_pending else "refund_failed"
+            case_status = "action_required"
+
+    # Confidence boost if we have strong evidence
+    if all_refs:
+        confidence = min(confidence + 0.15, 1.0)
+
+    # ---- affected_entities ----
+    order_ids = entity_res.get("resolved_order_ids", [])
+    item_ids = []
+    seller_ids = []
+    payment_refs = []
+    shipment_ids = []
+
+    if items and isinstance(items, list):
+        item_ids = [i.get("item_id") for i in items if i.get("item_id")]
+    if sellers and isinstance(sellers, list):
+        seller_ids = [s.get("seller_id") for s in sellers if s.get("seller_id")]
+    if payments and isinstance(payments, list):
+        payment_refs = [p.get("payment_id") for p in payments if p.get("payment_id")]
+    if shipment and isinstance(shipment, dict):
+        sid = shipment.get("shipment_id")
+        if sid:
+            shipment_ids = [sid]
+
+    # ---- claim_assessments ----
+    claims = []
+    claim_id = 1
+    for issue in [primary_issue] + secondary_issues:
+        if issue != "insufficient_evidence":
+            claims.append({
+                "claim_id": f"claim_{claim_id}",
+                "verdict": (
+                    "supported" if primary_issue != "insufficient_evidence" else "unsupported"
+                ),
+                "confidence": round(confidence, 3),
+                "evidence_refs": all_refs[:5],
+            })
+            claim_id += 1
+
+    # ---- entity_resolution ----
+    entity_resolution = {
+        "status": entity_res.get("status", "not_found"),
+        "resolved_order_ids": order_ids,
+        "rejected_candidates": entity_res.get("rejected_candidates", []),
+        "confidence": entity_res.get("confidence", 0.0),
+    }
+
+    # ---- customer_context ----
+    customer_context = {
+        "customer_unique_id": entity_res.get("customer_unique_id"),
+        "related_order_ids": order_ids,
+    }
+
+    # ---- shipment_analysis ----
+    shipment_verdict = "insufficient_evidence"
+    late_sellers = []
+    timeline_complete = False
+
+    if shipment and isinstance(shipment, dict):
+        status = shipment.get("status", "")
+        if status == "on_time":
+            shipment_verdict = "on_time"
+        elif status == "seller_delay":
+            shipment_verdict = "seller_delay"
+        elif status == "logistics_delay":
+            shipment_verdict = "logistics_delay"
+        elif status == "lost":
+            shipment_verdict = "lost"
+        elif status == "returned":
+            shipment_verdict = "returned"
+        elif status == "delivered":
+            shipment_verdict = "on_time"
+        timeline_complete = bool(shipment.get("delivered_at") or shipment.get("status"))
+
+    if sellers and isinstance(sellers, list):
+        for s in sellers:
+            if s.get("delivery_status") == "late":
+                sid = s.get("seller_id")
+                if sid:
+                    late_sellers.append(sid)
+
+    shipment_analysis = {
+        "verdict": shipment_verdict,
+        "late_seller_ids": late_sellers[:20],
+        "timeline_complete": timeline_complete,
+    }
+
+    # ---- payment_analysis ----
+    captured = 0.0
+    refunded = 0.0
+    refundable = 0.0
+    payment_verdict = "insufficient_evidence"
+
+    if payments and isinstance(payments, list):
+        captured = sum(p.get("amount_brl", 0) for p in payments if isinstance(p, dict))
+        payment_verdict = "reconciled"
+    if refunds and isinstance(refunds, list):
+        refunded = sum(r.get("amount_brl", 0) for r in refunds if isinstance(r, dict))
+        if refunded > 0:
+            payment_verdict = "refunded"
+    if order and isinstance(order, dict):
+        order_total = order.get("total_amount_brl", 0)
+        refundable = max(0, order_total - captured + refunded)
+
+    payment_analysis = {
+        "verdict": payment_verdict,
+        "captured_total_brl": round(captured, 2) if captured else None,
+        "refunded_total_brl": round(refunded, 2) if refunded else None,
+        "refundable_total_brl": round(refundable, 2) if refundable else None,
+    }
+
+    # ---- root_cause_analysis ----
+    ranked_causes = []
+    responsible_parties = []
+
+    if primary_issue in ("late_delivery_seller", "late_delivery_logistics"):
+        ranked_causes.append({"cause_code": "DELAYED_SHIPMENT", "rank": 1})
+        party_type = "seller" if primary_issue == "late_delivery_seller" else "logistics_provider"
+        seller_id = None
+        if sellers and isinstance(sellers, list):
+            seller_id = sellers[0].get("seller_id")
+        responsible_parties.append({"party_type": party_type, "party_id": seller_id})
+    elif primary_issue in ("payment_mismatch", "duplicate_charge"):
+        ranked_causes.append({"cause_code": "PAYMENT_PROCESSING_ERROR", "rank": 1})
+        responsible_parties.append({"party_type": "payment_provider", "party_id": None})
+    elif primary_issue in ("refund_pending", "refund_failed"):
+        ranked_causes.append({"cause_code": "REFUND_PROCESSING_DELAY", "rank": 1})
+        responsible_parties.append({"party_type": "platform", "party_id": None})
+
+    root_cause_analysis = {
+        "ranked_causes": ranked_causes[:5],
+        "responsible_parties": responsible_parties[:5],
+    }
+
+    # ---- financial_resolution ----
+    recommended_refund = 0.0
+    refund_lines = []
+
+    if primary_issue == "late_delivery_seller":
+        recommended_refund = captured * 0.5
+        if order_ids:
+            refund_lines.append({
+                "reason_code": "LATE_DELIVERY_SELLER",
+                "amount_brl": round(recommended_refund, 2),
+                "entity_id": order_ids[0],
+            })
+    elif primary_issue == "late_delivery_logistics":
+        recommended_refund = captured * 0.3
+        if order_ids:
+            refund_lines.append({
+                "reason_code": "LATE_DELIVERY_LOGISTICS",
+                "amount_brl": round(recommended_refund, 2),
+                "entity_id": order_ids[0],
+            })
+    elif primary_issue == "payment_mismatch":
+        if order and isinstance(order, dict):
+            diff = abs(order.get("total_amount_brl", 0) - captured)
+            recommended_refund = diff
+            refund_lines.append({
+                "reason_code": "PAYMENT_MISMATCH",
+                "amount_brl": round(diff, 2),
+                "entity_id": order_ids[0] if order_ids else None,
+            })
+    elif primary_issue in ("refund_pending", "refund_failed"):
+        if order and isinstance(order, dict):
+            recommended_refund = order.get("total_amount_brl", 0)
+            refund_lines.append({
+                "reason_code": "REFUND_FAILURE",
+                "amount_brl": round(recommended_refund, 2),
+                "entity_id": order_ids[0] if order_ids else None,
+            })
+
+    financial_resolution = {
+        "currency": "BRL",
+        "recommended_refund_brl": round(recommended_refund, 2),
+        "refund_lines": refund_lines[:10],
+    }
+
+    # ---- resolution_actions ----
+    actions = []
+    if primary_issue in ("late_delivery_seller", "late_delivery_logistics"):
+        actions.extend(["contact_seller", "request_partial_refund", "update_delivery_estimate"])
+    elif primary_issue in ("payment_mismatch", "duplicate_charge"):
+        actions.extend(["investigate_payment_gateway", "reconcile_payment", "issue_refund"])
+    elif primary_issue in ("refund_pending", "refund_failed"):
+        actions.extend(["retry_refund", "contact_payment_provider", "escalate_to_platform"])
+    elif primary_issue == "insufficient_evidence":
+        actions.append("request_additional_information")
+
+    # Deduplicate and limit
+    actions = list(dict.fromkeys(actions))[:8]
+
+    return {
+        "schema_version": "day09-l3b-output-v2",
+        "case_id": case_id,
+        "assessment": {
+            "primary_issue": primary_issue,
+            "secondary_issues": secondary_issues[:10],
+            "case_status": case_status,
+            "confidence": round(confidence, 3),
+        },
+        "affected_entities": {
+            "order_ids": order_ids[:20],
+            "item_ids": item_ids[:20],
+            "seller_ids": seller_ids[:20],
+            "payment_references": payment_refs[:20],
+            "shipment_ids": shipment_ids[:20],
+        },
+        "claim_assessments": claims[:5],
+        "entity_resolution": entity_resolution,
+        "customer_context": customer_context,
+        "shipment_analysis": shipment_analysis,
+        "payment_analysis": payment_analysis,
+        "root_cause_analysis": root_cause_analysis,
+        "evidence_refs": all_refs[:30],
+        "data_conflicts": conflicts[:5],
+        "financial_resolution": financial_resolution,
+        "resolution_actions": actions,
+    }
+
+
 async def solve_case(
     case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
 ) -> dict[str, Any]:
+<<<<<<< Updated upstream
     case_id = case["case_id"]
     mcp = CaseScopedGateway(case_id, gateway, trace)
     bus = Bus(case_id, trace)
@@ -1136,3 +1879,138 @@ async def solve_case(
         attributes={"mcp_calls": mcp.calls, "conflicts": len(output["data_conflicts"])},
     )
     return output
+=======
+    """Implement the L3B multi-agent workflow."""
+    case_id = case["case_id"]
+
+    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+
+    # Shared cache and trace for this case
+    cache = CaseCache()
+    mcp = MCPClient(gateway, trace, case_id, "coordinator", cache)
+
+    # ---- Phase 1: Entity Resolution ----
+    entity_resolver = EntityResolver(mcp, trace, case_id, case)
+    entity_res = await entity_resolver.resolve()
+
+    customer_unique_id = entity_res.get("customer_unique_id")
+    order_id = entity_res.get("order_id")
+
+    if not order_id:
+        # Cannot proceed without order_id
+        output = _build_output(case_id, case, entity_res, {}, [], [])
+        trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+        return output
+
+    # ---- Phase 2: Parallel Specialist Investigation ----
+    order_agent = OrderProductAgent(MCPClient(gateway, trace, case_id, "order_agent", cache))
+    shipment_agent = ShipmentAgent(MCPClient(gateway, trace, case_id, "shipment_agent", cache))
+    payment_agent = PaymentRefundAgent(MCPClient(gateway, trace, case_id, "payment_agent", cache))
+    policy_agent = PolicyAgent(MCPClient(gateway, trace, case_id, "policy_agent", cache))
+    customer_agent = CustomerAgent(MCPClient(gateway, trace, case_id, "customer_agent", cache))
+
+    # Dispatch all in parallel
+    trace.emit(
+        case_id=case_id,
+        event_type="task_assigned",
+        actor="coordinator",
+        target="order_agent",
+        attributes={"order_id": order_id},
+    )
+    trace.emit(
+        case_id=case_id,
+        event_type="task_assigned",
+        actor="coordinator",
+        target="shipment_agent",
+        attributes={"order_id": order_id},
+    )
+    trace.emit(
+        case_id=case_id,
+        event_type="task_assigned",
+        actor="coordinator",
+        target="payment_agent",
+        attributes={"order_id": order_id},
+    )
+    trace.emit(
+        case_id=case_id,
+        event_type="task_assigned",
+        actor="coordinator",
+        target="policy_agent",
+        attributes={"category": case.get("complaint", {}).get("type", "general")},
+    )
+    if customer_unique_id:
+        trace.emit(
+            case_id=case_id,
+            event_type="task_assigned",
+            actor="coordinator",
+            target="customer_agent",
+            attributes={"customer_unique_id": customer_unique_id},
+        )
+
+    order_task = order_agent.investigate(order_id)
+    shipment_task = shipment_agent.investigate(order_id)
+    payment_task = payment_agent.investigate(order_id)
+    policy_task = policy_agent.investigate(
+        case.get("complaint", {}).get("type", "general"),
+        case.get("complaint", {}).get("description", ""),
+    )
+    if customer_unique_id:
+        customer_task = customer_agent.investigate(customer_unique_id)
+    else:
+        customer_task = asyncio.sleep(0, result={"evidence_refs": []})
+
+    order_res, shipment_res, payment_res, policy_res, customer_res = await asyncio.gather(
+        order_task, shipment_task, payment_task, policy_task, customer_task, return_exceptions=True
+    )
+
+    # Normalize results
+    all_evidence = {
+        "order": order_res if isinstance(order_res, dict) else {"evidence_refs": []},
+        "shipment": shipment_res if isinstance(shipment_res, dict) else {"evidence_refs": []},
+        "payment": payment_res if isinstance(payment_res, dict) else {"evidence_refs": []},
+        "policy": policy_res if isinstance(policy_res, dict) else {"evidence_refs": []},
+        "customer": customer_res if isinstance(customer_res, dict) else {"evidence_refs": []},
+    }
+
+    # ---- Phase 3: Conflict Resolution ----
+    conflict_resolver = ConflictResolver(trace, case_id)
+    conflicts, resolution_notes = conflict_resolver.resolve(all_evidence, entity_res)
+
+    # ---- Phase 4: Build Draft Output ----
+    draft_output = _build_output(
+        case_id, case, entity_res, all_evidence, conflicts, resolution_notes
+    )
+
+    # ---- Phase 5: Verification ----
+    verifier = Verifier(trace, case_id)
+    max_verify_loops = 2
+    for _ in range(max_verify_loops):
+        issues = verifier.verify(draft_output, all_evidence, entity_res)
+        if not issues:
+            break
+        # Simple auto-fix for common issues
+        if "orphan evidence_refs" in str(issues):
+            # Remove orphan refs
+            all_refs_set = set()
+            for ev in all_evidence.values():
+                all_refs_set.update(ev.get("evidence_refs", []))
+            draft_output["evidence_refs"] = [
+                r for r in draft_output.get("evidence_refs", []) if r in all_refs_set
+            ]
+        if "confidence out of bounds" in str(issues):
+            draft_output["assessment"]["confidence"] = max(
+                0, min(1, draft_output["assessment"]["confidence"])
+            )
+    else:
+        # Max loops reached - still return output but log
+        trace.emit(
+            case_id=case_id,
+            event_type="verification_completed",
+            actor="verifier",
+            decision_code="MAX_LOOPS_REACHED",
+            attributes={"remaining_issues": issues},
+        )
+
+    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    return draft_output
+>>>>>>> Stashed changes
